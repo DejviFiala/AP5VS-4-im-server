@@ -2,116 +2,209 @@ package utb.fai;
 
 import java.io.*;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
 import java.util.concurrent.*;
 
 public class SocketHandler {
-	/** mySocket je socket, o který se bude tento SocketHandler starat */
-	Socket mySocket;
+    Socket mySocket;
+    String clientID;
+    ActiveHandlers activeHandlers;
+    ArrayBlockingQueue<String> messages = new ArrayBlockingQueue<>(20);
+    CountDownLatch startSignal = new CountDownLatch(2);
+    OutputHandler outputHandler = new OutputHandler();
+    InputHandler inputHandler = new InputHandler();
+    volatile boolean inputFinished = false;
 
-	/** client ID je øetìzec ve formátu <IP_adresa>:<port> */
-	String clientID;
+    private String userName = null;
+    private Set<String> groups = ConcurrentHashMap.newKeySet();
 
-	/**
-	 * activeHandlers je reference na mnoinu vech právì bìících SocketHandlerù.
-	 * Potøebujeme si ji udrovat, abychom mohli zprávu od tohoto klienta
-	 * poslat vem ostatním!
-	 */
-	ActiveHandlers activeHandlers;
+    public SocketHandler(Socket mySocket, ActiveHandlers activeHandlers) {
+        this.mySocket = mySocket;
+        clientID = mySocket.getInetAddress().toString() + ":" + mySocket.getPort();
+        this.activeHandlers = activeHandlers;
+    }
 
-	/**
-	 * messages je fronta pøíchozích zpráv, kterou musí mít kaý klient svoji
-	 * vlastní - pokud bude je pøetíená nebo nefunkèní klientova sí,
-	 * èekají zprávy na doruèení právì ve frontì messages
-	 */
-	ArrayBlockingQueue<String> messages = new ArrayBlockingQueue<String>(20);
+    public String getUserName() {
+        return userName;
+    }
 
-	/**
-	 * startSignal je synchronizaèní závora, která zaøizuje, aby oba tasky
-	 * OutputHandler.run() a InputHandler.run() zaèaly ve stejný okamik.
-	 */
-	CountDownLatch startSignal = new CountDownLatch(2);
+    public Set<String> getGroups() {
+        return groups;
+    }
 
-	/** outputHandler.run() se bude starat o OutputStream mého socketu */
-	OutputHandler outputHandler = new OutputHandler();
-	/** inputHandler.run() se bude starat o InputStream mého socketu */
-	InputHandler inputHandler = new InputHandler();
-	/**
-	 * protoe v outputHandleru nedovedu detekovat uzavøení socketu, pomùe mi
-	 * inputFinished
-	 */
-	volatile boolean inputFinished = false;
+    class OutputHandler implements Runnable {
+        public void run() {
+            OutputStreamWriter writer;
+            try {
+                startSignal.countDown();
+                startSignal.await();
+                writer = new OutputStreamWriter(mySocket.getOutputStream(), StandardCharsets.ISO_8859_1);
+                writer.write("Welcome! Please enter your username (no spaces):\n");
+                writer.flush();
+                while (!inputFinished) {
+                    String m = messages.take();
+                    writer.write(m + "\r\n");
+                    writer.flush();
+                }
+            } catch (IOException | InterruptedException e) {
+                e.printStackTrace();
+            } finally {
+                try {
+                    mySocket.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
 
-	public SocketHandler(Socket mySocket, ActiveHandlers activeHandlers) {
-		this.mySocket = mySocket;
-		clientID = mySocket.getInetAddress().toString() + ":" + mySocket.getPort();
-		this.activeHandlers = activeHandlers;
-	}
+    class InputHandler implements Runnable {
+        public void run() {
+            try {
+                startSignal.countDown();
+                startSignal.await();
+                BufferedReader reader = new BufferedReader(new InputStreamReader(mySocket.getInputStream(), StandardCharsets.ISO_8859_1));
+                OutputStreamWriter writer = new OutputStreamWriter(mySocket.getOutputStream(), StandardCharsets.ISO_8859_1);
 
-	class OutputHandler implements Runnable {
-		public void run() {
-			OutputStreamWriter writer;
-			try {
-				System.err.println("DBG>Output handler starting for " + clientID);
-				startSignal.countDown();
-				startSignal.await();
-				System.err.println("DBG>Output handler running for " + clientID);
-				writer = new OutputStreamWriter(mySocket.getOutputStream(), "UTF-8");
-				writer.write("\nYou are connected from " + clientID + "\n");
-				writer.flush();
-				while (!inputFinished) {
-					String m = messages.take();// blokující ètení - pokud není ve frontì zpráv nic, uspi se!
-					writer.write(m + "\r\n"); // pokud nìjaké zprávy od ostatních máme,
-					writer.flush(); // poleme je naemu klientovi
-					System.err.println("DBG>Message sent to " + clientID + ":" + m + "\n");
-				}
-			} catch (IOException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
-			} catch (InterruptedException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
-			}
-			System.err.println("DBG>Output handler for " + clientID + " has finished.");
+                // Setting username
+                while (userName == null) {
+                    String nameInput = reader.readLine();
+                    if (nameInput == null) {
+                        break;
+                    }
+                    nameInput = nameInput.trim();
+                    if (!nameInput.isEmpty() && !nameInput.contains(" ")) {
+                        synchronized (activeHandlers) {
+                            if (activeHandlers.isUserNameAvailable(nameInput)) {
+                                userName = nameInput;
+                                writer.write("Your username has been set to: " + userName + "\n");
+                                writer.flush();
+                                activeHandlers.addUserName(userName, SocketHandler.this);
+                                groups.add("public");
+                                writer.write("You have been automatically joined to the group 'public'.\n");
+                                writer.flush();
+                            } else {
+                                writer.write("This username is already taken, please choose another.\n");
+                                writer.flush();
+                            }
+                        }
+                    } else {
+                        writer.write("Invalid username. Please try again.\n");
+                        writer.flush();
+                    }
+                }
 
-		}
-	}
+                if (userName == null) {
+                    inputFinished = true;
+                    messages.offer("Connection closed.");
+                    return;
+                }
 
-	class InputHandler implements Runnable {
-		public void run() {
-			try {
-				System.err.println("DBG>Input handler starting for " + clientID);
-				startSignal.countDown();
-				startSignal.await();
-				System.err.println("DBG>Input handler running for " + clientID);
-				String request = "";
-				/**
-				 * v okamiku, kdy nás Thread pool spustí, pøidáme se do mnoiny
-				 * vech aktivních handlerù, aby chodily zprávy od ostatních i nám
-				 */
-				activeHandlers.add(SocketHandler.this);
-				BufferedReader reader = new BufferedReader(new InputStreamReader(mySocket.getInputStream(), "UTF-8"));
-				while ((request = reader.readLine()) != null) { // pøila od mého klienta nìjaká zpráva?
-					// ano - poli ji vem ostatním klientùm
-					request = "From client " + clientID + ": " + request;
-					System.out.println(request);
-					activeHandlers.sendMessageToAll(SocketHandler.this, request);
-				}
-				inputFinished = true;
-				messages.offer("OutputHandler, wakeup and die!");
-			} catch (UnknownHostException e) {
-				e.printStackTrace();
-			} catch (IOException e) {
-				e.printStackTrace();
-			} catch (InterruptedException e) {
-				e.printStackTrace();
-			} finally {
-				// remove yourself from the set of activeHandlers
-				synchronized (activeHandlers) {
-					activeHandlers.remove(SocketHandler.this);
-				}
-			}
-			System.err.println("DBG>Input handler for " + clientID + " has finished.");
-		}
+                activeHandlers.add(SocketHandler.this);
 
-	}
+                String request = "";
+                while ((request = reader.readLine()) != null) {
+                    request = request.trim();
+                    if (request.isEmpty()) {
+                        continue;
+                    }
+
+                    if (request.startsWith("#")) {
+                        // Command processing
+                        if (request.startsWith("#setMyName ")) {
+                            String newName = request.substring(11).trim();
+                            if (!newName.isEmpty() && !newName.contains(" ")) {
+                                synchronized (activeHandlers) {
+                                    if (activeHandlers.isUserNameAvailable(newName)) {
+                                        activeHandlers.removeUserName(userName);
+                                        userName = newName;
+                                        activeHandlers.addUserName(userName, SocketHandler.this);
+                                        writer.write("Your username has been changed to: " + userName + "\n");
+                                        writer.flush();
+                                    } else {
+                                        writer.write("This username is already taken.\n");
+                                        writer.flush();
+                                    }
+                                }
+                            } else {
+                                writer.write("Invalid username.\n");
+                                writer.flush();
+                            }
+                        } else if (request.startsWith("#sendPrivate ")) {
+                            String[] parts = request.split(" ", 3);
+                            if (parts.length >= 3) {
+                                String targetUserName = parts[1];
+                                String message = parts[2];
+                                SocketHandler targetHandler = activeHandlers.getHandlerByUserName(targetUserName);
+                                if (targetHandler != null) {
+                                    String formattedMessage = "[" + userName + "] >> " + message;
+                                    if (!targetHandler.messages.offer(formattedMessage)) {
+                                        System.err.printf("Client %s message queue is full, dropping the message!\n", targetUserName);
+                                    }
+                                    writer.write("Private message sent to user " + targetUserName + ".\n");
+                                    writer.flush();
+                                } else {
+                                    writer.write("User " + targetUserName + " is not online.\n");
+                                    writer.flush();
+                                }
+                            } else {
+                                writer.write("Invalid command format. Usage: #sendPrivate <username> <message>\n");
+                                writer.flush();
+                            }
+                        } else if (request.startsWith("#join ")) {
+                            String groupName = request.substring(6).trim();
+                            if (!groupName.isEmpty()) {
+                                groups.add(groupName);
+                                writer.write("You have joined the group: " + groupName + "\n");
+                                writer.flush();
+                            } else {
+                                writer.write("Invalid group name.\n");
+                                writer.flush();
+                            }
+                        } else if (request.startsWith("#leave ")) {
+                            String groupName = request.substring(7).trim();
+                            if (!groupName.isEmpty()) {
+                                if (groups.remove(groupName)) {
+                                    writer.write("You have left the group: " + groupName + "\n");
+                                    writer.flush();
+                                } else {
+                                    writer.write("You are not a member of the group: " + groupName + "\n");
+                                    writer.flush();
+                                }
+                            } else {
+                                writer.write("Invalid group name.\n");
+                                writer.flush();
+                            }
+                        } else if (request.equals("#groups")) {
+                            String groupList = String.join(",", groups);
+                            writer.write("You are a member of groups: " + groupList + "\n");
+                            writer.flush();
+                        } else {
+                            writer.write("Unknown command.\n");
+                            writer.flush();
+                        }
+                    } else {
+                        // Sending message to groups
+                        String formattedMessage = "[" + userName + "] >> " + request;
+                        activeHandlers.sendMessageToGroup(SocketHandler.this, formattedMessage);
+                    }
+                }
+                inputFinished = true;
+                messages.offer("OutputHandler, wake up and die!");
+            } catch (IOException | InterruptedException e) {
+                e.printStackTrace();
+            } finally {
+                activeHandlers.remove(SocketHandler.this);
+                if (userName != null) {
+                    activeHandlers.removeUserName(userName);
+                }
+                try {
+                    mySocket.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
 }
