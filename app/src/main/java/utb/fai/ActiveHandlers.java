@@ -1,10 +1,11 @@
 package utb.fai;
 
 import java.util.*;
+import java.util.concurrent.*;
 
 public class ActiveHandlers {
-    private static final long serialVersionUID = 1L;
-    private HashSet<SocketHandler> activeHandlersSet = new HashSet<SocketHandler>();
+    private HashSet<SocketHandler> activeHandlersSet = new HashSet<>();
+    private ConcurrentHashMap<String, SocketHandler> userNameMap = new ConcurrentHashMap<>();
 
     /**
      * sendMessageToAll - Pole zprávu vem aktivním klientùm kromì sebe sama
@@ -12,12 +13,14 @@ public class ActiveHandlers {
      * @param sender  - reference odesílatele
      * @param message - øetìzec se zprávou
      */
-    synchronized void sendMessageToAll(SocketHandler sender, String message) {
-        for (SocketHandler handler : activeHandlersSet) // pro vechny aktivní handlery
-            if (handler != sender) {
-                if (!handler.messages.offer(message)) // zkus pøidat zprávu do fronty jeho zpráv
-                    System.err.printf("Client %s message queue is full, dropping the message!\n", handler.clientID);
+    synchronized void sendMessageToGroup(SocketHandler sender, String message) {
+        for (SocketHandler handler : activeHandlersSet) {
+            if (handler != sender && !Collections.disjoint(handler.getGroups(), sender.getGroups())) {
+                if (!handler.messages.offer(message)) {
+                    System.err.printf("Client %s message queue is full, dropping the message!\n", handler.getUserName());
+                }
             }
+        }
     }
 
     /**
@@ -40,5 +43,21 @@ public class ActiveHandlers {
      */
     synchronized boolean remove(SocketHandler handler) {
         return activeHandlersSet.remove(handler);
+    }
+
+    synchronized boolean isUserNameAvailable(String userName) {
+        return !userNameMap.containsKey(userName);
+    }
+
+    synchronized void addUserName(String userName, SocketHandler handler) {
+        userNameMap.put(userName, handler);
+    }
+
+    synchronized void removeUserName(String userName) {
+        userNameMap.remove(userName);
+    }
+
+    SocketHandler getHandlerByUserName(String userName) {
+        return userNameMap.get(userName);
     }
 }
